@@ -1,0 +1,123 @@
+import groovy.json.JsonSlurperClassic
+
+@NonCPS
+def jsonParse(def json) {
+    new groovy.json.JsonSlurperClassic().parseText(json)
+}
+
+pipeline {
+    agent {
+        node {
+            label 'steambuild'
+        }
+    }
+
+    parameters {
+        string(name: 'STEAM_APP_ID', defaultValue: '', description: 'Steam App ID')
+        string(name: 'BUILD_DEPOT_ID', defaultValue: '', description: 'Steam pDepot ID')
+        string(name: 'PROJECT_NAME', defaultValue: '', description: 'Project Name')
+        string(name: 'STEAM_BRANCH_NAME', defaultValue: '', description: 'Branch')
+    }
+
+    stages {
+        stage('Download Local Build') {
+            steps {
+                script {
+                    def url = "https://build-api.cloud.unity3d.com/api/v1/orgs/${Organization}/projects/${PROJECT_NAME}/buildtargets/_local/builds?buildStatus=success&platform=standalonewindows".toURL()
+     
+                    def jsonText = url.getText(requestProperties: [Authorization: "Basic ${unityApiKey}"])
+                    def json = jsonParse(jsonText)
+
+                    BUILD_DESC = json.first()['label']
+                    def downloadUrl = json.first()['links']['download_primary']['href']
+                    sh "wget -q -N --header='Authorization: Basic \"${unityApiKey}\"' -O \"${PROJECT_NAME}.zip\" \"${downloadUrl}\""
+
+                    echo "File download complete. Unzipping."
+                    sh "mkdir -p ${workspace}/content/win32"
+                    sh "unzip -q -o ${workspace}/${PROJECT_NAME}.zip -d ${workspace}/content/win32"
+                }
+            }
+        }
+
+        stage('Generate Application Files') {
+            steps {
+                sh """
+echo '"appbuild"
+{
+    "appid"	"'${STEAM_APP_ID}'"
+    "desc" "'${BUILD_DESC}'" // description for this build
+    "contentroot" "content\\" // root content folder, relative to location of this file
+    "buildoutput" "output\\" // build output folder for .log, .csm & .csd files, relative to location of this file
+    "setlive" "'${STEAM_BRANCH_NAME}'" // branch to set live after successful build, non if empty
+    "preview" "0" // to enable preview builds
+    "local"	""	// set to flie path of local content server 
+    
+    "depots"
+    {
+        "'${BUILD_DEPOT_ID}'" "depot_build_'${BUILD_DEPOT_ID}'.vdf"
+    }
+}' > "app_build_${STEAM_APP_ID}.vdf"
+"""
+
+                sh """
+echo '"DepotBuildConfig"
+{
+    "DepotID" "'${BUILD_DEPOT_ID}'"
+    "ContentRoot"	"win32\"
+    "FileMapping"
+    {
+        "LocalPath" "*"
+        
+        "DepotPath" "."
+        
+        "recursive" "1"
+    }
+    "FileExclusion" "*.pdb"
+}' > "depot_build_${BUILD_DEPOT_ID}.vdf"
+"""
+            }
+        }
+
+        stage('Upload to Steam') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'svcSteam', usernameVariable: 'username', passwordVariable: 'password')]) {
+                        def returnCode = sh ( script: '/mnt/efs/tools/Steam/steamcmd.sh +@ShutdownOnFailedCommand 1 +login ${username} ${password} +run_app_build $WORKSPACE/app_build_${STEAM_APP_ID}.vdf +exit', 
+                            returnStatus: true )
+                        if (returnCode != 0) {
+                            error("There was an issue uploading to Steam. Please check the connection or account authorization!")
+                        } 
+                    } 
+
+                }
+            }
+        }
+    }
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            script { 
+                if (env.DISCORD_WEBHOOK) {
+                    discordSend(
+                        webhookURL: "${ DISCORD_WEBHOOK }",
+                        successful: currentBuild.resultIsBetterOrEqualTo('SUCCESS'),
+                        title: "Upload Successful!",
+                        description: "${ BUILD_DESC } has been successfully uploaded to Steam on branch ${ STEAM_BRANCH_NAME }")
+                }
+            }
+        }
+        failure {
+            script {
+                if (env.DISCORD_WEBHOOK) {
+                    discordSend(
+                        webhookURL: "${ DISCORD_WEBHOOK }",
+                        successful: currentBuild.resultIsBetterOrEqualTo('FAILURE'),
+                        title: "Upload Failure!",
+                        description: "There was an issue uploading to Steam. Please check the connection or account authorization!")
+                }
+            }
+        }
+    }
+}

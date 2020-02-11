@@ -1,0 +1,212 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation Template to deploy Jenkins for TIA
+Parameters:
+  VpcId:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/vpc/default/id'
+  SubnetIds:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/vpc/default/subnets'
+  DefaultSecurityGroup:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/vpc/default/securitygroup'
+  EfsId:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/tia/dev/jenkins/home'
+  CertArn:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/vpc/certs/theindieaccord/arn'
+
+Resources:
+  HTTPSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Application
+          Value: Jenkins
+        - Key: Environment
+          Value: Development
+        - Key: Name
+          Value: tia-dev-jenkins-sg
+
+  ApplicationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Standard Jenkins Ports
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 172.31.0.0/16
+          Description: Allow from All Internal on Port 50000
+        - IpProtocol: tcp
+          FromPort: 50000
+          ToPort: 50000
+          CidrIp: 172.31.0.0/16
+          Description: Allow from All Internal on Port 50000
+      Tags:
+        - Key: Application
+          Value: Jenkins
+        - Key: Environment
+          Value: Development
+        - Key: Name
+          Value: tia-dev-jenkins-sg
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+      LogGroupName: "/tia/dev/jenkins"
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      SecurityGroups: 
+        - !Ref DefaultSecurityGroup
+        - !Ref HTTPSecurityGroup
+      Subnets: !Split [",", !Ref SubnetIds]
+      Type: application
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      HealthCheckPath: "/login"
+
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+        
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertArn
+
+  HTTPListener:
+   Type: "AWS::ElasticLoadBalancingV2::Listener"
+   Properties:
+     DefaultActions:
+       - Type: "redirect"
+         RedirectConfig:
+           Protocol: "HTTPS"
+           Port: "443"
+           Host: "#{host}"
+           Path: "/#{path}"
+           Query: "#{query}"
+           StatusCode: "HTTP_301"
+     LoadBalancerArn: !Ref LoadBalancer
+     Port: 80
+     Protocol: "HTTP"
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: arn:aws:iam::378717956087:instance-profile/tia-dev-jenkins
+        ImageId: ami-00068cd7555f543d5
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            MaxPrice: "0.0208"
+            SpotInstanceType: one-time
+        InstanceType: t3.small
+        KeyName: tia-jenkins
+        SecurityGroupIds:
+          - !Ref DefaultSecurityGroup
+          - !Ref ApplicationSecurityGroup
+        UserData:
+          Fn::Base64:
+            !Sub |
+              #!/bin/bash
+              yum update -y
+              yum install -y \
+                docker \
+                amazon-efs-utils \
+                amazon-ecr-credential-helper
+
+              /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource ASG --region ${AWS::Region}
+
+              systemctl start docker
+
+              mkdir ~/.docker
+              mkdir /mnt/efs
+
+              mount -t efs ${EfsId}:/ /mnt/efs
+              chown -R 1000 /mnt/efs
+
+              echo '{ "credStore":"ecr-login" }' > ~/.docker/config.json
+              $(aws ecr get-login --no-include-email --region ${AWS::Region})
+
+              /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource ASG --region ${AWS::Region}
+
+              docker run -d --restart unless-stopped --name jenkins -p 8080:8080 -p 50000:50000 \
+                  -v /mnt/efs:/var/jenkins_home --log-driver=awslogs --log-opt awslogs-group='${LogGroup}' --log-opt awslogs-region='${AWS::Region}' \
+                  ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/jenkins
+
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AvailabilityZones: !GetAZs 'us-east-1'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MaxSize: "2"
+      MinSize: "1"
+      HealthCheckGracePeriod: 300
+      TargetGroupARNs: 
+        - !Ref TargetGroup
+      Tags:
+        - Key: Environment
+          Value: Developmment
+          PropagateAtLaunch: True
+        - Key: Name
+          Value: Jenkins
+          PropagateAtLaunch: True
+    CreationPolicy:
+      ResourceSignal:
+        Count: '1'
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 0
+        MaxBatchSize: 1
+        PauseTime: "PT5M"
+        WaitOnResourceSignals: True
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+
+  RecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: theindieaccord.com.
+      Comment: DNS Name for JenkinsName
+      Name: jenkins.theindieaccord.com.
+      Type: CNAME
+      TTL: '900'
+      ResourceRecords:
+        - !GetAtt LoadBalancer.DNSName
