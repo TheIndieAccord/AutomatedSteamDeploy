@@ -17,6 +17,12 @@ Parameters:
   CertArn:
     Type: 'AWS::SSM::Parameter::Value<String>'
     Default: '/vpc/certs/theindieaccord/arn'
+  DefaultCidr:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/vpc/default/cidr'
+  VersionTag:
+    Type: String
+    Default: 'latest'
 
 Resources:
   HTTPSecurityGroup:
@@ -50,12 +56,12 @@ Resources:
         - IpProtocol: tcp
           FromPort: 8080
           ToPort: 8080
-          CidrIp: 172.31.0.0/16
+          CidrIp: !Ref DefaultCidr
           Description: Allow from All Internal on Port 50000
         - IpProtocol: tcp
           FromPort: 50000
           ToPort: 50000
-          CidrIp: 172.31.0.0/16
+          CidrIp: !Ref DefaultCidr
           Description: Allow from All Internal on Port 50000
       Tags:
         - Key: Application
@@ -162,7 +168,7 @@ Resources:
 
               docker run -d --restart unless-stopped --name jenkins -p 8080:8080 -p 50000:50000 \
                   -v /mnt/efs:/var/jenkins_home --log-driver=awslogs --log-opt awslogs-group='${LogGroup}' --log-opt awslogs-region='${AWS::Region}' \
-                  ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/jenkins
+                  ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/jenkins:${VersionTag}
 
   ASG:
     Type: AWS::AutoScaling::AutoScalingGroup
